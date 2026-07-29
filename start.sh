@@ -10,9 +10,6 @@ export LD_LIBRARY_PATH=/usr/lib64-nvidia:$LD_LIBRARY_PATH
 echo "Updating packages..."
 apt update -y
 
-echo "Installing Git..."
-apt install -y git
-
 echo "Installing Python dependencies..."
 pip install --upgrade pip
 pip install -r requirements.txt
