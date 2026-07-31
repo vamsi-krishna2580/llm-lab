@@ -1,12 +1,8 @@
 import os
-import time
-import uuid
-from typing import List, Literal, Optional, Union
-
 import torch
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
@@ -33,47 +29,15 @@ app = FastAPI(
 )
 
 # ============================================================
-# OpenAI-Compatible Request / Response Models
+# Request / Response Models
 # ============================================================
 
-class ChatMessage(BaseModel):
-    role: Literal["system", "user", "assistant"]
-    content: str
+class ChatRequest(BaseModel):
+    message: str
 
 
-class ChatCompletionRequest(BaseModel):
-    model: str = Field(default=MODEL)
-    messages: List[ChatMessage]
-    temperature: Optional[float] = 0.7
-    top_p: Optional[float] = 0.9
-    n: Optional[int] = 1
-    stream: Optional[bool] = False
-    stop: Optional[Union[str, List[str]]] = None
-    max_tokens: Optional[int] = 512
-    presence_penalty: Optional[float] = 0.0
-    frequency_penalty: Optional[float] = 0.0
-    user: Optional[str] = None
-
-
-class ChatCompletionChoice(BaseModel):
-    index: int
-    message: ChatMessage
-    finish_reason: Literal["stop", "length", "content_filter", "tool_calls", "function_call"]
-
-
-class Usage(BaseModel):
-    prompt_tokens: int
-    completion_tokens: int
-    total_tokens: int
-
-
-class ChatCompletionResponse(BaseModel):
-    id: str
-    object: Literal["chat.completion"] = "chat.completion"
-    created: int
-    model: str
-    choices: List[ChatCompletionChoice]
-    usage: Usage
+class ChatResponse(BaseModel):
+    response: str
 
 
 # ============================================================
@@ -132,10 +96,10 @@ model = AutoModelForCausalLM.from_pretrained(
 print("Model Loaded Successfully!")
 
 # ============================================================
-# System Prompt (fallback, only used if no system message is provided)
+# System Prompt
 # ============================================================
 
-DEFAULT_SYSTEM_PROMPT = """
+SYSTEM_PROMPT = """
 You are a helpful, friendly and knowledgeable AI assistant.
 
 Give accurate and concise answers.
@@ -149,54 +113,49 @@ Do not make up facts.
 # Helper Function
 # ============================================================
 
-def generate(
-    messages: List[ChatMessage],
-    temperature: float = 0.7,
-    top_p: float = 0.9,
-    max_tokens: int = 512,
-):
-    # Ensure there is a system message; otherwise fall back to default
-    chat_messages = [m.dict() for m in messages]
-    if not any(m["role"] == "system" for m in chat_messages):
-        chat_messages = [{"role": "system", "content": DEFAULT_SYSTEM_PROMPT}] + chat_messages
+def generate(prompt: str):
+
+    messages = [
+        {
+            "role": "system",
+            "content": SYSTEM_PROMPT,
+        },
+        {
+            "role": "user",
+            "content": prompt,
+        },
+    ]
 
     inputs = tokenizer.apply_chat_template(
-        chat_messages,
+        messages,
         tokenize=True,
         add_generation_prompt=True,
         return_tensors="pt",
         return_dict=True,
     ).to(model.device)
 
-    prompt_tokens = inputs["input_ids"].shape[1]
-
     with torch.inference_mode():
 
         outputs = model.generate(
             **inputs,
-            max_new_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
+            max_new_tokens=512,
+            temperature=0.7,
+            top_p=0.9,
             top_k=50,
             repetition_penalty=1.05,
             do_sample=True,
             pad_token_id=tokenizer.eos_token_id,
         )
 
-    generated_ids = outputs[0][prompt_tokens:]
-    completion_tokens = generated_ids.shape[0]
-
     response = tokenizer.decode(
-        generated_ids,
+        outputs[0][inputs["input_ids"].shape[1]:],
         skip_special_tokens=True,
     )
 
     if "</think>" in response:
         response = response.split("</think>")[-1].strip()
 
-    finish_reason = "length" if completion_tokens >= max_tokens else "stop"
-
-    return response, prompt_tokens, completion_tokens, finish_reason
+    return response
 
 # ============================================================
 # Routes
@@ -223,60 +182,19 @@ def health():
     }
 
 
-@app.get("/v1/models")
-def list_models():
+@app.post("/chat", response_model=ChatResponse)
+def chat(req: ChatRequest):
 
-    return {
-        "object": "list",
-        "data": [
-            {
-                "id": MODEL,
-                "object": "model",
-                "created": int(time.time()),
-                "owned_by": "local",
-            }
-        ],
-    }
-
-
-@app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
-def chat_completions(req: ChatCompletionRequest):
-
-    if not req.messages:
+    if not req.message.strip():
         raise HTTPException(
             status_code=400,
-            detail="messages cannot be empty."
+            detail="Message cannot be empty."
         )
 
-    if req.stream:
-        raise HTTPException(
-            status_code=400,
-            detail="Streaming is not supported by this endpoint."
-        )
+    answer = generate(req.message)
 
-    answer, prompt_tokens, completion_tokens, finish_reason = generate(
-        messages=req.messages,
-        temperature=req.temperature,
-        top_p=req.top_p,
-        max_tokens=req.max_tokens,
-    )
-
-    return ChatCompletionResponse(
-        id=f"chatcmpl-{uuid.uuid4().hex}",
-        created=int(time.time()),
-        model=req.model,
-        choices=[
-            ChatCompletionChoice(
-                index=0,
-                message=ChatMessage(role="assistant", content=answer),
-                finish_reason=finish_reason,
-            )
-        ],
-        usage=Usage(
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=prompt_tokens + completion_tokens,
-        ),
+    return ChatResponse(
+        response=answer
     )
 
 
